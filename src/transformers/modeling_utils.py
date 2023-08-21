@@ -2934,6 +2934,12 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             kwargs = {"device_map": device_map, "offload_dir": offload_folder, "offload_index": offload_index}
             if "skip_keys" in inspect.signature(dispatch_model).parameters:
                 kwargs["skip_keys"] = model._skip_keys_device_placement
+            if "skip_keys" not in kwargs.keys():
+                kwargs["skip_keys"] = ["labels"]
+            elif isinstance(kwargs["skip_keys"], list):
+                kwargs["skip_keys"].append("labels")
+            else:
+                kwargs["skip_keys"] = [kwargs["skip_keys"], "labels"]
             dispatch_model(model, **kwargs)
 
         if output_loading_info:

@@ -2676,7 +2676,17 @@ class Trainer:
         Prepares one `data` before feeding it to the model, be it a tensor or a nested list/dictionary of tensors.
         """
         if isinstance(data, Mapping):
-            return type(data)({k: self._prepare_input(v) for k, v in data.items()})
+            new_data = type(data)({})
+            for k, v in data.items():
+                if k == "labels" and isinstance(v, torch.Tensor):
+                    kwargs = {"device": torch.device("cuda:6")}
+                    if self.is_deepspeed_enabled and (torch.is_floating_point(data) or torch.is_complex(data)):
+                        kwargs.update({"dtype": self.accelerator.state.deepspeed_plugin.hf_ds_config.dtype()})
+                    new_data.update({k: v.to(**kwargs)})
+                else:
+                    new_data.update({k: self._prepare_input(v)})
+            return new_data
+            # return type(data)({k: self._prepare_input(v) for k, v in data.items()})
         elif isinstance(data, (tuple, list)):
             return type(data)(self._prepare_input(v) for v in data)
         elif isinstance(data, torch.Tensor):
