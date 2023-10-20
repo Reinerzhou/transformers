@@ -37,6 +37,24 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
 
+import types
+import functools
+from torch._dynamo.bytecode_transformation import unique_id
+from torch._dynamo.bytecode_transformation import get_code_keys
+
+def copy_code(code):
+    keys = get_code_keys()
+    code_options = {k: getattr(code, k) for k in keys}
+    return types.CodeType(*[code_options[k] for k in keys])
+
+def copy_func(func):
+    code = copy_code(func.__code__)
+    res = types.FunctionType(code, func.__globals__, name=func.__name__,
+                           argdefs=func.__defaults__,
+                           closure=func.__closure__)
+    res = functools.update_wrapper(res, func)
+    res.__kwdefaults__ = func.__kwdefaults__
+    return res
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -72,6 +90,10 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
 
 class LlamaRMSNorm(nn.Module):
+    def __new__(cls, *args, **kwargs):
+        klass = type(unique_id(cls.__name__), (cls,), {"forward" : copy_func(LlamaRMSNorm.forward)})
+        return object.__new__(klass)
+
     def __init__(self, hidden_size, eps=1e-6):
         """
         LlamaRMSNorm is equivalent to T5LayerNorm
@@ -89,6 +111,10 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
+    def __new__(cls, *args, **kwargs):
+        klass = type(unique_id(cls.__name__), (cls,), {"forward" : copy_func(LlamaRotaryEmbedding.forward)})
+        return object.__new__(klass)
+
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
@@ -114,6 +140,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
             self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
             self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+
         return (
             self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
@@ -139,6 +166,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
 
 
 class LlamaMLP(nn.Module):
+    def __new__(cls, *args, **kwargs):
+        klass = type(unique_id(cls.__name__), (cls,), {"forward" : copy_func(LlamaMLP.forward)})
+        return object.__new__(klass)
+
     def __init__(
         self,
         hidden_size: int,
@@ -157,6 +188,9 @@ class LlamaMLP(nn.Module):
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
+    def __new__(cls, *args, **kwargs):
+        klass = type(unique_id(cls.__name__), (cls,), {"forward" : copy_func(LlamaAttention.forward)})
+        return object.__new__(klass)
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
@@ -189,8 +223,8 @@ class LlamaAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
 
+        bsz, q_len, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -249,6 +283,11 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
+    def __new__(cls, *args, **kwargs):
+        klass = type(unique_id(cls.__name__), (cls,), {"forward" : copy_func(LlamaDecoderLayer.forward)})
+        LlamaPreTrainedModel._no_split_modules.append(klass.__name__)
+        return object.__new__(klass)
+
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -341,7 +380,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
     config_class = LlamaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["LlamaDecoderLayer"]
+    _no_split_modules = []
     _skip_keys_device_placement = "past_key_values"
     _keys_to_ignore_on_load_unexpected = [r"decoder\.version"]
 
