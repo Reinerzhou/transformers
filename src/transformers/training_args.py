@@ -1334,17 +1334,17 @@ class TrainingArguments:
             if version.parse(version.parse(torch.__version__).base_version) == version.parse("2.0.0") and self.fp16:
                 raise ValueError("--optim adamw_torch_fused with --fp16 requires PyTorch>2.0")
 
-        if (
-            self.framework == "pt"
-            and is_torch_available()
-            and (self.device.type != "cuda")
-            and (get_xla_device_type(self.device) != "GPU")
-            and (self.fp16 or self.fp16_full_eval)
-        ):
-            raise ValueError(
-                "FP16 Mixed precision training with AMP or APEX (`--fp16`) and FP16 half precision evaluation"
-                " (`--fp16_full_eval`) can only be used on CUDA devices."
-            )
+        # if (
+        #     self.framework == "pt"
+        #     and is_torch_available()
+        #     and (self.device.type != "cuda")
+        #     and (get_xla_device_type(self.device) != "GPU")
+        #     and (self.fp16 or self.fp16_full_eval)
+        # ):
+        #     raise ValueError(
+        #         "FP16 Mixed precision training with AMP or APEX (`--fp16`) and FP16 half precision evaluation"
+        #         " (`--fp16_full_eval`) can only be used on CUDA devices."
+        #     )
 
         if (
             self.framework == "pt"
