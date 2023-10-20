@@ -34,6 +34,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 
 from tqdm.auto import tqdm
 
+from torch.profiler.profiler import profile
+from torch.autograd.profiler import record_function
+
+import torch_dipu
 
 # Integrations must be imported before ML frameworks:
 # isort: off
@@ -393,7 +397,8 @@ class Trainer:
             if len(devices) > 1:
                 self.is_model_parallel = True
             else:
-                self.is_model_parallel = self.args.device != torch.device(devices[0])
+                # self.is_model_parallel = self.args.device != torch.device(devices[0])
+                self.is_model_parallel = False
 
             # warn users
             logger.info(
@@ -711,6 +716,8 @@ class Trainer:
         # torch.compile
         if args.torch_compile and not is_torch_compile_available():
             raise RuntimeError("Using torch.compile requires PyTorch 2.0 or higher.")
+
+        self.model = self.model.to(f"xpu:{os.getenv('DICP_TOPS_DEVICE_ID', default='1')}")
 
     def add_callback(self, callback):
         """
@@ -1913,7 +1920,16 @@ class Trainer:
                 rng_to_sync = True
 
             step = -1
+            # with profile(
+            #     # activities=[
+            #     #     torch.profiler.ProfilerActivity.CPU,
+            #     # ],
+            #     with_stack=True,
+            #     # with_modules=True,
+            # ) as prof:
             for step, inputs in enumerate(epoch_iterator):
+                # 记录每个 step 开始的时间
+                step_start_time = time.time()
                 total_batched_samples += 1
                 if rng_to_sync:
                     self._load_rng_state(resume_from_checkpoint)
@@ -1934,8 +1950,11 @@ class Trainer:
                 if step % args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
+                training_step_start = time.time()
                 with self.accelerator.accumulate(model):
+                    # training_step 包含了前向、反向图执行的时间
                     tr_loss_step = self.training_step(model, inputs)
+                print('!@: print training step time: ', time.time() - training_step_start)
 
                 if (
                     args.logging_nan_inf_filter
@@ -2004,7 +2023,13 @@ class Trainer:
                         scale_after = self.scaler.get_scale()
                         optimizer_was_run = scale_before <= scale_after
                     else:
-                        self.optimizer.step()
+                        # 计算 optimizer 时间
+                        optimizer_start = time.time()
+                        with record_function("optimizer_opt process"):
+                            # self.optimizer_opt = torch.compile(self.optimizer.step, backend='topsgraph')
+                            # self.optimizer_opt()
+                            self.optimizer.step()
+                        print('!@: print optimizer time: ', time.time() - optimizer_start)
                         optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
 
                     if optimizer_was_run:
@@ -2023,6 +2048,13 @@ class Trainer:
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
+            # 整个 step 的执行时间
+            print('!@: step_time: ', time.time() - step_start_time)
+            output_path = "/home/cse/zhousl/dicp-alpaca-lora/profile_data/test_zeros.json"
+            # prof.export_chrome_trace(output_path)
+            # prof.export_stacks(f"/home/cse/zhousl/dicp-alpaca-lora/profile_data/stacks.txt")
+            # prof.export_stacks(f"/home/cse/zhousl/dicp-alpaca-lora/profile_data/stacks.txt", "self_cpu_time_total")
+
             if step < 0:
                 logger.warning(
                     "There seems to be not a single sample in your epoch_iterator, stopping training at step"
@@ -2682,7 +2714,7 @@ class Trainer:
                     kwargs = {"device": torch.device("cuda:6")}
                     if self.is_deepspeed_enabled and (torch.is_floating_point(data) or torch.is_complex(data)):
                         kwargs.update({"dtype": self.accelerator.state.deepspeed_plugin.hf_ds_config.dtype()})
-                    new_data.update({k: v.to(**kwargs)})
+                    new_data.update({k: v})
                 else:
                     new_data.update({k: self._prepare_input(v)})
             return new_data
@@ -2740,6 +2772,7 @@ class Trainer:
 
         return ctx_manager
 
+    @record_function('training_step process')
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -2759,15 +2792,27 @@ class Trainer:
             `torch.Tensor`: The tensor with training loss on this batch.
         """
         model.train()
+
         inputs = self._prepare_inputs(inputs)
+        with record_function("copy data to xpu in train process"):
+            for k, v in inputs.items():
+                inputs[k] = v.to(f"xpu:{os.getenv('dicp_tops_device_id', default='1')}")
 
         if is_sagemaker_mp_enabled():
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
             return loss_mb.reduce_mean().detach().to(self.args.device)
 
-        with self.compute_loss_context_manager():
-            loss = self.compute_loss(model, inputs)
+        forward_start = None
+        backward_start = None
+        time_test = True
+        if time_test:
+            forward_start  = time.time()
 
+        with self.compute_loss_context_manager(), record_function("forward process"):
+            # 前向图计算
+            loss = self.compute_loss(model, inputs)
+        if time_test:
+            print('!@: print forward_time: ', time.time() - forward_start)
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
@@ -2777,7 +2822,13 @@ class Trainer:
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
-            self.accelerator.backward(loss)
+            if time_test:
+                backward_start= time.time()
+            # 反向图计算
+            with record_function("backward process"):
+                self.accelerator.backward(loss)
+            if time_test:
+                print('!@: print backward time: ', time.time() - backward_start)
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
