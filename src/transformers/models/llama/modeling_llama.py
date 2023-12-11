@@ -591,7 +591,6 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
-        # for idx, decoder_layer in enumerate(self.layers[:1]):
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -631,9 +630,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-
-            # torch._dynamo.graph_break()
-            break
+            break 
 
         hidden_states = self.norm(hidden_states)
 

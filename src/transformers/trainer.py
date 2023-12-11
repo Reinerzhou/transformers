@@ -546,6 +546,7 @@ class Trainer:
                     " `Trainer`. Make sure the lines `import torch_xla.core.xla_model as xm` and"
                     " `model.to(xm.xla_device())` is performed before the optimizer creation in your script."
                 )
+        
         if ((self.sharded_ddp is not None) or self.is_deepspeed_enabled or (self.fsdp is not None)) and (
             self.optimizer is not None or self.lr_scheduler is not None
         ):
@@ -717,7 +718,7 @@ class Trainer:
         if args.torch_compile and not is_torch_compile_available():
             raise RuntimeError("Using torch.compile requires PyTorch 2.0 or higher.")
 
-        self.model = self.model.to(f"xpu:{os.getenv('DICP_TOPS_DEVICE_ID', default='1')}")
+        self.model = self.model.to(f"xpu:{os.getenv('DICP_TOPS_DEVICE_ID', default='0')}")
 
     def add_callback(self, callback):
         """
@@ -1098,15 +1099,16 @@ class Trainer:
                     ],
                     "weight_decay": self.args.weight_decay,
                 },
-                {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
-                    ],
-                    "weight_decay": 0.0,
-                },
+                # {
+                #     "params": [
+                #         p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
+                #     ],
+                #     "weight_decay": 0.0,
+                # },
             ]
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            optimizer_kwargs.update({"foreach": False})
 
             if self.sharded_ddp == ShardedDDPOption.SIMPLE:
                 self.optimizer = OSS(
@@ -1860,7 +1862,8 @@ class Trainer:
         self.state.is_world_process_zero = self.is_world_process_zero()
 
         # tr_loss is a tensor to avoid synchronization of TPUs through .item()
-        tr_loss = torch.tensor(0.0).to(args.device)
+        # tr_loss = torch.tensor(0.0).to(args.device)
+        tr_loss = torch.tensor(0.0).to("xpu:0")
         # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
@@ -1919,141 +1922,143 @@ class Trainer:
                 steps_trained_in_current_epoch = 0
                 rng_to_sync = True
 
+            self.optimizer.step = torch.compile(self.optimizer.step, backend='topsgraph')
             step = -1
-            # with profile(
-            #     # activities=[
-            #     #     torch.profiler.ProfilerActivity.CPU,
-            #     # ],
-            #     with_stack=True,
-            #     # with_modules=True,
-            # ) as prof:
-            for step, inputs in enumerate(epoch_iterator):
-                # 记录每个 step 开始的时间
-                step_start_time = time.time()
-                total_batched_samples += 1
-                if rng_to_sync:
-                    self._load_rng_state(resume_from_checkpoint)
-                    rng_to_sync = False
-
-                # Skip past any already trained steps if resuming training
-                if steps_trained_in_current_epoch > 0:
-                    steps_trained_in_current_epoch -= 1
-                    if steps_trained_progress_bar is not None:
-                        steps_trained_progress_bar.update(1)
-                    if steps_trained_in_current_epoch == 0:
+            profile_flag = False
+            profile_context = contextlib.nullcontext()
+            if profile_flag:
+                profile_context = profile(
+                    ctivities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                    ],
+                )
+            with profile_context as prof:
+                for step, inputs in enumerate(epoch_iterator):
+                    # 记录每个 step 开始的时间
+                    # step_start_time = time.time()
+                    total_batched_samples += 1
+                    if rng_to_sync:
                         self._load_rng_state(resume_from_checkpoint)
-                    continue
-                elif steps_trained_progress_bar is not None:
-                    steps_trained_progress_bar.close()
-                    steps_trained_progress_bar = None
+                        rng_to_sync = False
 
-                if step % args.gradient_accumulation_steps == 0:
-                    self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
+                    # Skip past any already trained steps if resuming training
+                    if steps_trained_in_current_epoch > 0:
+                        steps_trained_in_current_epoch -= 1
+                        if steps_trained_progress_bar is not None:
+                            steps_trained_progress_bar.update(1)
+                        if steps_trained_in_current_epoch == 0:
+                            self._load_rng_state(resume_from_checkpoint)
+                        continue
+                    elif steps_trained_progress_bar is not None:
+                        steps_trained_progress_bar.close()
+                        steps_trained_progress_bar = None
 
-                training_step_start = time.time()
-                with self.accelerator.accumulate(model):
-                    # training_step 包含了前向、反向图执行的时间
-                    tr_loss_step = self.training_step(model, inputs)
-                print('!@: print training step time: ', time.time() - training_step_start)
+                    if step % args.gradient_accumulation_steps == 0:
+                        self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                if (
-                    args.logging_nan_inf_filter
-                    and not is_torch_tpu_available()
-                    and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
-                ):
-                    # if loss is nan or inf simply add the average of previous logged losses
-                    tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
-                else:
-                    tr_loss += tr_loss_step
+                    training_step_start = time.time()
+                    with self.accelerator.accumulate(model):
+                        # training_step 包含了前向、反向图执行的时间
+                        tr_loss_step = self.training_step(model, inputs)
+                    # print('!@: print training step time: ', time.time() - training_step_start)
 
-                self.current_flos += float(self.floating_point_ops(inputs))
+                    if (
+                        args.logging_nan_inf_filter
+                        and not is_torch_tpu_available()
+                        and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                    ):
+                        # if loss is nan or inf simply add the average of previous logged losses
+                        tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
+                    else:
+                        tr_loss += tr_loss_step
 
-                # should this be under the accumulate context manager?
-                # the `or` condition of `steps_in_epoch <= args.gradient_accumulation_steps` is not covered
-                # in accelerate
-                if total_batched_samples % args.gradient_accumulation_steps == 0 or (
-                    # last step in epoch but step is always smaller than gradient_accumulation_steps
-                    steps_in_epoch <= args.gradient_accumulation_steps
-                    and (step + 1) == steps_in_epoch
-                ):
-                    # Gradient clipping
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                        # deepspeed does its own clipping
+                    self.current_flos += float(self.floating_point_ops(inputs))
 
-                        if self.do_grad_scaling:
-                            # Reduce gradients first for XLA
-                            if is_torch_tpu_available():
-                                gradients = xm._fetch_gradients(self.optimizer)
-                                xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
-                            # AMP: gradients need unscaling
-                            self.scaler.unscale_(self.optimizer)
+                    # should this be under the accumulate context manager?
+                    # the `or` condition of `steps_in_epoch <= args.gradient_accumulation_steps` is not covered
+                    # in accelerate
+                    if total_batched_samples % args.gradient_accumulation_steps == 0 or (
+                        # last step in epoch but step is always smaller than gradient_accumulation_steps
+                        steps_in_epoch <= args.gradient_accumulation_steps
+                        and (step + 1) == steps_in_epoch
+                    ):
+                        # Gradient clipping
+                        if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                            # deepspeed does its own clipping
 
-                        if is_sagemaker_mp_enabled() and args.fp16:
-                            self.optimizer.clip_master_grads(args.max_grad_norm)
-                        elif hasattr(self.optimizer, "clip_grad_norm"):
-                            # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                            self.optimizer.clip_grad_norm(args.max_grad_norm)
-                        elif hasattr(model, "clip_grad_norm_"):
-                            # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
-                            model.clip_grad_norm_(args.max_grad_norm)
-                        elif self.use_apex:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            nn.utils.clip_grad_norm_(
-                                amp.master_params(self.optimizer),
-                                args.max_grad_norm,
-                            )
-                        else:
-                            self.accelerator.clip_grad_norm_(
-                                model.parameters(),
-                                args.max_grad_norm,
-                            )
+                            if self.do_grad_scaling:
+                                # Reduce gradients first for XLA
+                                if is_torch_tpu_available():
+                                    gradients = xm._fetch_gradients(self.optimizer)
+                                    xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
+                                # AMP: gradients need unscaling
+                                self.scaler.unscale_(self.optimizer)
 
-                    # Optimizer step
-                    optimizer_was_run = True
-                    if is_torch_tpu_available():
-                        if self.do_grad_scaling:
+                            if is_sagemaker_mp_enabled() and args.fp16:
+                                self.optimizer.clip_master_grads(args.max_grad_norm)
+                            elif hasattr(self.optimizer, "clip_grad_norm"):
+                                # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
+                                self.optimizer.clip_grad_norm(args.max_grad_norm)
+                            elif hasattr(model, "clip_grad_norm_"):
+                                # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
+                                model.clip_grad_norm_(args.max_grad_norm)
+                            elif self.use_apex:
+                                # Revert to normal clipping otherwise, handling Apex or full precision
+                                nn.utils.clip_grad_norm_(
+                                    amp.master_params(self.optimizer),
+                                    args.max_grad_norm,
+                                )
+                            else:
+                                with record_function("clip_grad_norm_"):
+                                    self.accelerator.clip_grad_norm_(
+                                        model.parameters(),
+                                        args.max_grad_norm,
+                                    )
+
+                        # Optimizer step
+                        optimizer_was_run = True
+                        if is_torch_tpu_available():
+                            if self.do_grad_scaling:
+                                self.scaler.step(self.optimizer)
+                                self.scaler.update()
+                            else:
+                                xm.optimizer_step(self.optimizer)
+                        elif self.do_grad_scaling:
+                            scale_before = self.scaler.get_scale()
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
+                            scale_after = self.scaler.get_scale()
+                            optimizer_was_run = scale_before <= scale_after
                         else:
-                            xm.optimizer_step(self.optimizer)
-                    elif self.do_grad_scaling:
-                        scale_before = self.scaler.get_scale()
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        scale_after = self.scaler.get_scale()
-                        optimizer_was_run = scale_before <= scale_after
+                            # 计算 optimizer 时间
+                            # optimizer_start = time.time()
+                            with record_function("optimizer_opt process"):
+                                # self.optimizer_opt()
+                                self.optimizer.step()
+                            # print('!@: print optimizer time: ', time.time() - optimizer_start)
+                            optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
+
+                        # if optimizer_was_run:
+                        #     # Delay optimizer scheduling until metrics are generated
+                        #     if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        #         self.lr_scheduler.step()
+
+                        model.zero_grad()
+                        self.state.global_step += 1
+                        self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                        self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+
+                        self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
                     else:
-                        # 计算 optimizer 时间
-                        optimizer_start = time.time()
-                        with record_function("optimizer_opt process"):
-                            # self.optimizer_opt = torch.compile(self.optimizer.step, backend='topsgraph')
-                            # self.optimizer_opt()
-                            self.optimizer.step()
-                        print('!@: print optimizer time: ', time.time() - optimizer_start)
-                        optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
+                        self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
-                    if optimizer_was_run:
-                        # Delay optimizer scheduling until metrics are generated
-                        if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                            self.lr_scheduler.step()
-
-                    model.zero_grad()
-                    self.state.global_step += 1
-                    self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
-                    self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
-                else:
-                    self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
-
-                if self.control.should_epoch_stop or self.control.should_training_stop:
-                    break
-            # 整个 step 的执行时间
-            print('!@: step_time: ', time.time() - step_start_time)
-            output_path = "/home/cse/zhousl/dicp-alpaca-lora/profile_data/test_zeros.json"
-            # prof.export_chrome_trace(output_path)
-            # prof.export_stacks(f"/home/cse/zhousl/dicp-alpaca-lora/profile_data/stacks.txt")
-            # prof.export_stacks(f"/home/cse/zhousl/dicp-alpaca-lora/profile_data/stacks.txt", "self_cpu_time_total")
+                    if self.control.should_epoch_stop or self.control.should_training_stop:
+                        break
+                    # 整个 step 的执行时间
+                    # print('!@: step_time: ', time.time() - step_start_time)
+            output_path = "/home/cse/zhousl/dicp-alpaca-lora/profile_data/test1111.json"
+            if profile_flag:
+                prof.export_chrome_trace(output_path)
 
             if step < 0:
                 logger.warning(
@@ -2354,11 +2359,11 @@ class Trainer:
             self._report_to_hp_search(trial, self.state.global_step, metrics)
 
             # Run delayed LR scheduler now that metrics are populated
-            if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                metric_to_check = self.args.metric_for_best_model
-                if not metric_to_check.startswith("eval_"):
-                    metric_to_check = f"eval_{metric_to_check}"
-                self.lr_scheduler.step(metrics[metric_to_check])
+            # if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            #     metric_to_check = self.args.metric_for_best_model
+            #     if not metric_to_check.startswith("eval_"):
+            #         metric_to_check = f"eval_{metric_to_check}"
+            #     self.lr_scheduler.step(metrics[metric_to_check])
 
         if self.control.should_save:
             self._save_checkpoint(model, trial, metrics=metrics)
@@ -2794,9 +2799,9 @@ class Trainer:
         model.train()
 
         inputs = self._prepare_inputs(inputs)
-        with record_function("copy data to xpu in train process"):
+        with record_function("copy data to dipu in train process"):
             for k, v in inputs.items():
-                inputs[k] = v.to(f"xpu:{os.getenv('dicp_tops_device_id', default='1')}")
+                inputs[k] = v.to(f"xpu:{os.getenv('DICP_TOPS_DEVICE_ID', default='0')}")
 
         if is_sagemaker_mp_enabled():
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
@@ -2812,10 +2817,10 @@ class Trainer:
             # 前向图计算
             loss = self.compute_loss(model, inputs)
         if time_test:
-            print('!@: print forward_time: ', time.time() - forward_start)
+            # print('!@: print forward_time: ', time.time() - forward_start)
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
-
+        # torch_dipu.current_stream(2).synchronize()
         if self.do_grad_scaling:
             self.scaler.scale(loss).backward()
         elif self.use_apex:
@@ -2828,7 +2833,7 @@ class Trainer:
             with record_function("backward process"):
                 self.accelerator.backward(loss)
             if time_test:
-                print('!@: print backward time: ', time.time() - backward_start)
+                # print('!@: print backward time: ', time.time() - backward_start)
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
