@@ -2809,7 +2809,7 @@ class Trainer:
 
         forward_start = None
         backward_start = None
-        time_test = True
+        time_test = False
         if time_test:
             forward_start  = time.time()
 
@@ -2817,7 +2817,7 @@ class Trainer:
             # 前向图计算
             loss = self.compute_loss(model, inputs)
         if time_test:
-            # print('!@: print forward_time: ', time.time() - forward_start)
+            print('!@: print forward_time: ', time.time() - forward_start)
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
         # torch_dipu.current_stream(2).synchronize()
@@ -2833,7 +2833,7 @@ class Trainer:
             with record_function("backward process"):
                 self.accelerator.backward(loss)
             if time_test:
-                # print('!@: print backward time: ', time.time() - backward_start)
+                print('!@: print backward time: ', time.time() - backward_start)
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
