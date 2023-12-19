@@ -104,8 +104,11 @@ class LlamaRMSNorm(nn.Module):
 
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        # variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+
+        # TODO: auto_cast in backend.
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon).to(hidden_states.dtype)
 
         return (self.weight * hidden_states).to(input_dtype)
 
@@ -140,7 +143,6 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
             self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
             self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
-
         return (
             self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
@@ -258,9 +260,9 @@ class LlamaAttention(nn.Module):
                 )
             attn_weights = attn_weights + attention_mask
             # tmp remove
-            # attn_weights = torch.max(
-            #     attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-            # )
+            attn_weights = torch.max(
+                attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device, dtype=attn_weights.dtype)
+            )
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -344,7 +346,6 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
 
         outputs = (hidden_states,)
 
@@ -512,7 +513,9 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
+            expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
+                inputs_embeds.device
+            )
             combined_attention_mask = (
                 expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
             )
@@ -591,7 +594,6 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
-        # for idx, decoder_layer in enumerate(self.layers[:1]):
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
